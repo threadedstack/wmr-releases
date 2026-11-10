@@ -1,0 +1,132 @@
+# The hosted site (https://wmr.threadedstack.com, Firebase Hosting site wmr-app of project wmn-runbooks) is deployed from here on GitHub Actions,
+# so a wmr release never needs `firebase login` on the Mac that builds it. This file lives in threadedstack/wmr-releases; its source is
+# deploy/wmr-releases/ in the wmr repository (copy it there; docs/DEPLOY.md). The release (scripts/release-steps.ts on that Mac) builds the site
+# folder, uploads it as wmr-site-<version>.tar.gz (+ .sha256) to the DRAFT release "site-staging" of this repository, and dispatches this
+# workflow by hand with the version and a stage:
+#   preview  - deploys the site to the preview channel release-v<X-Y-Z> (7 days), after deleting old channels (the 2 newest
+#              versions' release and before- channels stay), and puts the preview's address in site-preview-url-<version>.txt on
+#              site-staging, which the release reads for its live check
+#   promote  - keeps the live version as the channel before-release-v<X-Y-Z> (the first copy only), then makes the preview live
+#   rollback - puts that kept version live again
+# Firebase sign-in is keyless (Workload Identity Federation, the same pool WMN's release repository uses): pool "github" of project wmn-runbooks
+# accepts threadedstack repositories, and gh-actions-deploy@wmn-runbooks needs the workloadIdentityUser binding for this repository.
+name: Hosted site
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "wmr version (for example 0.1.4)"
+        required: true
+      stage:
+        description: "preview, promote or rollback"
+        required: true
+        type: choice
+        options: [preview, promote, rollback]
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: hosted-site
+  cancel-in-progress: false
+
+env:
+  SITE: wmr-app
+  PROJECT: wmn-runbooks
+  STAGING: site-staging
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Version and channel
+        run: |
+          v="${VERSION#v}"
+          case "$v" in ''|*[!0-9.]*) echo "bad version: $VERSION" >&2; exit 1;; esac
+          echo "V=$v" >> "$GITHUB_ENV"
+          echo "CHANNEL=release-v${v//./-}" >> "$GITHUB_ENV"
+
+      - name: Download and check the site (preview)
+        if: ${{ inputs.stage == 'preview' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dl" "$RUNNER_TEMP/site"
+          cd "$RUNNER_TEMP/dl"
+          gh release download "$STAGING" --repo "$GITHUB_REPOSITORY" --pattern "wmr-site-$V.tar.gz" --pattern "wmr-site-$V.tar.gz.sha256" --clobber
+          shasum -a 256 -c "wmr-site-$V.tar.gz.sha256"
+          tar -xzf "wmr-site-$V.tar.gz" -C "$RUNNER_TEMP/site"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/79296749603/locations/global/workloadIdentityPools/github/providers/github
+          service_account: gh-actions-deploy@wmn-runbooks.iam.gserviceaccount.com
+
+      - run: npm install -g firebase-tools@15.16.0
+
+      - name: Delete old channels (preview)
+        if: ${{ inputs.stage == 'preview' }}
+        working-directory: ${{ runner.temp }}/site
+        run: |
+          # the site's channels are capped (50): only the 2 newest versions' release and before- channels stay, and this version's own
+          firebase hosting:channel:list --site "$SITE" --json --project "$PROJECT" > "$RUNNER_TEMP/channels.json"
+          node -e '
+            const fs = require("fs");
+            const text = fs.readFileSync(process.env.RUNNER_TEMP + "/channels.json", "utf8");
+            const names = (JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1)).result?.channels ?? [])
+              .map((c) => (c.name ?? "").split("/").at(-1));
+            const ver = (n) => /^(?:before-)?release-v(\d+)-(\d+)-(\d+)$/.exec(n)?.slice(1).map(Number);
+            const key = (v) => v.map((x) => String(x).padStart(6, "0")).join(".");
+            const versions = [...new Set(names.map(ver).filter(Boolean).map(key))].sort().reverse();
+            const kept = new Set([...versions.slice(0, 2), key(ver(process.env.CHANNEL))]);
+            console.log(names.filter((n) => ver(n) && !kept.has(key(ver(n)))).join("\n"));
+          ' > "$RUNNER_TEMP/drop.txt"
+          while read -r id; do
+            [ -n "$id" ] && firebase hosting:channel:delete "$id" --site "$SITE" --force --project "$PROJECT"
+          done < "$RUNNER_TEMP/drop.txt"
+          exit 0
+
+      - name: Deploy the preview channel
+        if: ${{ inputs.stage == 'preview' }}
+        working-directory: ${{ runner.temp }}/site
+        run: |
+          firebase hosting:channel:deploy "$CHANNEL" --only "$SITE" --expires 7d --json --project "$PROJECT" > "$RUNNER_TEMP/deploy.json"
+          cat "$RUNNER_TEMP/deploy.json"
+          url=$(node -e '
+            const fs = require("fs");
+            const t = fs.readFileSync(process.env.RUNNER_TEMP + "/deploy.json", "utf8");
+            const j = JSON.parse(t.slice(t.indexOf("{"), t.lastIndexOf("}") + 1));
+            process.stdout.write(j.result?.[process.env.SITE]?.url ?? "");
+          ')
+          if [ -z "$url" ]; then echo "the preview channel deploy printed no url" >&2; exit 1; fi
+          printf '%s' "$url" > "$RUNNER_TEMP/site-preview-url-$V.txt"
+          gh release upload "$STAGING" "$RUNNER_TEMP/site-preview-url-$V.txt" --clobber --repo "$GITHUB_REPOSITORY"
+          echo "preview: $url"
+
+      - name: A Firebase folder (promote, rollback)
+        if: ${{ inputs.stage != 'preview' }}
+        # the firebase CLI refuses hosting commands outside a folder with a firebase.json; the site folder only exists for preview
+        run: |
+          mkdir -p "$RUNNER_TEMP/fb"
+          printf '{"hosting":{"site":"%s","public":"."}}\n' "$SITE" > "$RUNNER_TEMP/fb/firebase.json"
+
+      - name: Promote
+        if: ${{ inputs.stage == 'promote' }}
+        working-directory: ${{ runner.temp }}/fb
+        run: |
+          firebase hosting:channel:list --site "$SITE" --json --project "$PROJECT" > "$RUNNER_TEMP/channels.json"
+          if grep -q "/channels/before-$CHANNEL\"" "$RUNNER_TEMP/channels.json"; then
+            echo "before-$CHANNEL is kept already"
+          else
+            firebase hosting:clone "$SITE:live" "$SITE:before-$CHANNEL" --project "$PROJECT"
+          fi
+          firebase hosting:clone "$SITE:$CHANNEL" "$SITE:live" --project "$PROJECT"
+
+      - name: Roll back
+        if: ${{ inputs.stage == 'rollback' }}
+        working-directory: ${{ runner.temp }}/fb
+        run: firebase hosting:clone "$SITE:before-$CHANNEL" "$SITE:live" --project "$PROJECT"
