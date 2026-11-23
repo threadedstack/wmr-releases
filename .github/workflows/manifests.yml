@@ -1,0 +1,96 @@
+# Keeps the published update manifests of wmr valid (source: release/manifests.yml of threadedstack/wmr, installed as
+# .github/workflows/manifests.yml of threadedstack/wmr-releases by hand once and then by the release run's plan job). Every day it reads
+# the manifests of the latest release (scripts/manifest-expiry.ts); when one has fewer than 21 days left it re-signs both with the update
+# key and uploads them (scripts/resign-manifests.ts --upload), then pushes the deploy record to main of wmr. Clients refuse an expired
+# manifest, so this keeps updates working between releases. A run by hand does the same.
+name: manifests
+
+on:
+  schedule:
+    - cron: "41 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manifests
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  resign:
+    runs-on: ubuntu-24.04
+    environment: release
+    defaults:
+      run:
+        working-directory: wmr
+    env:
+      WMR_RELEASE_CI: "1"
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmr
+          permission-contents: write
+      - id: releases-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmr-releases
+          permission-contents: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmr
+          ref: main
+          token: ${{ steps.token.outputs.token }}
+          path: wmr
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: how long the manifests are valid
+        id: expiry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # exit 1 means fewer than 21 days left; any other failure fails the run
+          rc=0
+          bun scripts/manifest-expiry.ts || rc=$?
+          if [ "$rc" = 0 ]; then echo due=0 >> "$GITHUB_OUTPUT"
+          elif [ "$rc" = 1 ]; then echo due=1 >> "$GITHUB_OUTPUT"
+          else exit "$rc"; fi
+      - name: the update key
+        if: steps.expiry.outputs.due == '1'
+        env:
+          UPDATE_ED25519_PEM: ${{ secrets.UPDATE_ED25519_PEM }}
+        run: bun scripts/ci-secrets.ts update-key
+      - name: re-sign and upload both manifests
+        if: steps.expiry.outputs.due == '1'
+        env:
+          GH_TOKEN: ${{ steps.releases-token.outputs.token }}
+        run: bun scripts/resign-manifests.ts --upload
+      - name: push the deploy record to main of wmr
+        if: steps.expiry.outputs.due == '1'
+        run: |
+          git config user.name "wmr release"
+          git config user.email release@wmr.invalid
+          if git diff --quiet -- deploys/records.jsonl; then echo "no deploy record to push"; exit 0; fi
+          git add deploys/records.jsonl
+          git commit -m "Deploy record: release manifests re-signed"
+          for _ in 1 2 3 4 5; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main
+          done
+          echo "the deploy record was not pushed"; exit 1
+      - name: delete the secret files
+        if: always()
+        run: rm -rf "${RUNNER_TEMP:?}/wmr-ci-secrets"
