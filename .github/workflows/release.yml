@@ -328,6 +328,13 @@ jobs:
       - run: bun install --frozen-lockfile
       # the engine folder is built on the runner from the wmd npm packages the lockfile pins (vm.wasm, the guest files, wmd-fixtures-gen) and the
       # images pulled by their names; every release builds it (the release's engine archive carries only 5 of the images, so it cannot stand in)
+      - name: let the machine use /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
       - name: browsers for Playwright (the base snapshots boot each image in Chromium)
         timeout-minutes: 65
         run: bash scripts/ci-playwright.sh chromium
