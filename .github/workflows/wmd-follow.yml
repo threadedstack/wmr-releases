@@ -1,6 +1,7 @@
 # The wmd follower (source: release/wmd-follow.yml of threadedstack/wmr, installed as .github/workflows/wmd-follow.yml of
-# threadedstack/wmr-releases by hand once and then by the release run's plan job). Every hour at :17, and by hand with a version,
-# it looks at the latest release X of threadedstack/wmd-releases. It stops unless npm has @threadedstack/wmd@X and
+# threadedstack/wmr-releases by hand once and then by the release run's plan job). wmd's npm publish sends the event wmd-release
+# with client_payload.version (threadedstack/wmd#85); a schedule every 15 minutes catches a missed event (GitHub drops most scheduled runs of a
+# quiet repository: the hourly one ran every 8 to 10 hours), and by hand with a version. Extra runs do nothing. It looks at the latest release X of threadedstack/wmd-releases. It stops unless npm has @threadedstack/wmd@X and
 # @threadedstack/wmd-web@X, stops when main of wmr already pins X or newer, and stops while the issue `wmd bump failed: vX` is open
 # (scripts/wmd-follow.ts decide). Otherwise it commits the pin on the branch wmd/vX of wmr, runs the checks on it (typecheck, the unit
 # tests that import a wmd package, the walks made for that wmd version, one engine build) and fast-forwards main to it. A failing check
@@ -10,8 +11,10 @@
 name: wmd follow
 
 on:
+  repository_dispatch:
+    types: [wmd-release]
   schedule:
-    - cron: "17 * * * *"
+    - cron: "2,17,32,47 * * * *"
   workflow_dispatch:
     inputs:
       version:
@@ -68,7 +71,7 @@ jobs:
         id: look
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
-          WANT: ${{ inputs.version }}
+          WANT: ${{ inputs.version || github.event.client_payload.version }}
         run: |
           # wmd-releases is public; the latest release is the newest one that is not a prerelease or a draft
           tag=${WANT:+v${WANT#v}}
@@ -76,7 +79,7 @@ jobs:
           v=${tag#v}
           echo "wmd release: $tag"
           npm_has() { [ "$(npm view "$1@$v" version 2>/dev/null)" = "$v" ] && echo 1 || echo 0; }
-          # wmd publishes to npm about 20 minutes after its GitHub release, and the hourly schedule can come hours late,
+          # wmd publishes to npm about 20 minutes after its GitHub release, and a scheduled run can come hours late,
           # so a run that sees the release first waits for npm instead of stopping until a later run that may not come
           for i in $(seq 1 30); do
             [ "$(npm_has @threadedstack/wmd)" = 1 ] && [ "$(npm_has @threadedstack/wmd-web)" = 1 ] && break
