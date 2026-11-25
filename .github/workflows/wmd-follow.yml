@@ -79,15 +79,23 @@ jobs:
           v=${tag#v}
           echo "wmd release: $tag"
           npm_has() { [ "$(npm view "$1@$v" version 2>/dev/null)" = "$v" ] && echo 1 || echo 0; }
+          # wmd's platform packages (its optionalDependencies) reach npm after wmd itself: bun add of a wmd whose platform package is missing fails
+          wmd_has() {
+            [ "$(npm_has @threadedstack/wmd)" = 1 ] || { echo 0; return; }
+            for p in $(npm view "@threadedstack/wmd@$v" optionalDependencies --json 2>/dev/null | jq -r 'keys[]?'); do
+              [ "$(npm_has "$p")" = 1 ] || { echo 0; return; }
+            done
+            echo 1
+          }
           # wmd publishes to npm about 20 minutes after its GitHub release, and a scheduled run can come hours late,
           # so a run that sees the release first waits for npm instead of stopping until a later run that may not come
           for i in $(seq 1 30); do
-            [ "$(npm_has @threadedstack/wmd)" = 1 ] && [ "$(npm_has @threadedstack/wmd-web)" = 1 ] && break
+            [ "$(wmd_has)" = 1 ] && [ "$(npm_has @threadedstack/wmd-web)" = 1 ] && break
             echo "waiting for npm to have wmd $v ($i)"
             sleep 60
           done
           gh issue list -R threadedstack/wmr --state open --search 'wmd bump failed in:title' --limit 100 --json title --jq '.[].title' > "$RUNNER_TEMP/issues.txt"
-          out=$(bun scripts/wmd-follow.ts decide --tag "$tag" --npm-wmd "$(npm_has @threadedstack/wmd)" --npm-web "$(npm_has @threadedstack/wmd-web)" \
+          out=$(bun scripts/wmd-follow.ts decide --tag "$tag" --npm-wmd "$(wmd_has)" --npm-web "$(npm_has @threadedstack/wmd-web)" \
             --package package.json --issues "$RUNNER_TEMP/issues.txt")
           echo "$out"
           echo "$out" >> "$GITHUB_OUTPUT"
